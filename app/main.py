@@ -1,17 +1,20 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import google.generativeai as genai
+import os
 import pandas as pd
 import torch
 import joblib
 import numpy as np
-from transformers import pipeline
 import re
 from datetime import datetime, timedelta
 from collections import Counter, defaultdict
 from typing import List, Dict, Optional
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 from sklearn.metrics.pairwise import cosine_similarity
+import uuid
+import json
 from itertools import combinations
 from camel_tools.utils.normalize import (
     normalize_unicode,
@@ -23,7 +26,6 @@ from camel_tools.tokenizers.word import simple_word_tokenize
 from camel_tools.disambig.mle import MLEDisambiguator
 from camel_tools.ner import NERecognizer
 from camel_tools.utils.dediac import dediac_ar
-from camel_tools.sentiment import SentimentAnalyzer
 
 from nltk.corpus import stopwords
 import nltk
@@ -38,23 +40,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+genai.configure(api_key="AIzaSyD77B4XJnspFZpRMeYqFZX7JEQMUWMTxpo")
 
-class TrendPredictor:
-    def predict_trends(self, target_class: str, date: str):
-        return np.random.rand() * 10
-
-
+############################################ Trends Extraction + text preprocessing ##########################################
 class TrendAnalyzer:
     def __init__(self):
         self.model_path = "./models"
         self.clf_model = AutoModelForSequenceClassification.from_pretrained(self.model_path)
         self.clf_tokenizer = AutoTokenizer.from_pretrained(self.model_path)
         self.label_encoder = joblib.load("label_encoder.pkl")
-        self.trend_predictor = TrendPredictor()
         self.embed_model = AutoModel.from_pretrained("aubmindlab/bert-base-arabertv2")
         self.embed_tokenizer = AutoTokenizer.from_pretrained("aubmindlab/bert-base-arabertv2")
 
-        # Load data with proper date parsing
         self.df = pd.read_csv("data/Data.csv")
         self.df["Date"] = pd.to_datetime(self.df["Date"], format='mixed', utc=True).dt.tz_localize(None)
 
@@ -66,16 +63,13 @@ class TrendAnalyzer:
         self.youtube_df["predicted_label"] = self.youtube_df["Title"].apply(self.predict_class)
         self.youtube_df["source"] = "youtube"
 
-        nltk.download('stopwords')  # Only needed once
+        nltk.download('stopwords')
         self.arabic_stopwords = set(stopwords.words('arabic'))
-
-        # Add domain-specific stopwords (e.g., sports terms)
         self.domain_stopwords = {
             'كرة', 'مباراة', 'فريق', 'الدوري', 'الرياضية',
             'المنتخب', 'أبطال', 'مشاهدة', 'أخبار', 'معلق',
-            'رياضة', 'هدف', 'حارس', 'ملعب', 'لاعب','دوري','مباراه','مشاهدة','كره','امام','موعد','قدم'
-
-                                                                                                'ملخص', 'الجوله',
+            'رياضة', 'هدف', 'حارس', 'ملعب', 'لاعب','دوري','مباراه','مشاهدة',
+            'كره','امام','موعد','قدم','ملخص','الجوله',
             'الانجليزي', 'اليوم', 'كامل',
             'العالم', 'شباب', 'افضل', 'ملحميه', 'التاريخيه',
             'اسيا', 'مصر', 'نصف', 'شاهد', 'سنه', 'سيناريو',
@@ -85,7 +79,6 @@ class TrendAnalyzer:
 
         try:
             self.disambiguator = MLEDisambiguator.pretrained()
-            self.sentiment_analyzer = SentimentAnalyzer.pretrained()
             self.ner = NERecognizer.pretrained()
             self.camel_available = True
         except Exception as e:
@@ -97,27 +90,23 @@ class TrendAnalyzer:
             return []
 
         try:
-            # Step 1: Comprehensive Normalization
             text = normalize_unicode(text)
-            text = normalize_alef_ar(text)  # Normalize all Alef variants
-            text = normalize_alef_maksura_ar(text)  # Normalize ى to ي
-            text = normalize_teh_marbuta_ar(text)  # Normalize ة to ه
-            text = dediac_ar(text)  # Remove diacritics
+            text = normalize_alef_ar(text)
+            text = normalize_alef_maksura_ar(text)
+            text = normalize_teh_marbuta_ar(text)
+            text = dediac_ar(text)
 
-            # Step 2: Advanced Cleaning
-            text = re.sub(r'[^\u0621-\u064A0-9\s]', '', text)  # Keep only Arabic letters and numbers
-            text = re.sub(r'\s+', ' ', text).strip()  # Normalize whitespace
+            text = re.sub(r'[^\u0621-\u064A0-9\s]', '', text)
+            text = re.sub(r'\s+', ' ', text).strip()
 
-            # Step 3: Tokenization with CAMeL Tools
             tokens = simple_word_tokenize(text)
 
-            # Step 4: Smart Filtering
             return [
                 token for token in tokens
-                if (len(token) > 2 and  # Minimum length requirement
-                    token not in self.all_stopwords and  # Combined stopwords (NLTK + custom)
-                    not token.isdigit() and  # Remove pure numbers
-                    not re.match(r'^[\u0621-\u064A]{1,2}$', token)  # Remove 1-2 letter Arabic words
+                if (len(token) > 2 and
+                    token not in self.all_stopwords and
+                    not token.isdigit() and
+                    not re.match(r'^[\u0621-\u064A]{1,2}$', token)
                     )
             ]
         except Exception as e:
@@ -194,10 +183,7 @@ class TrendAnalyzer:
             return []
 
         cutoff_date = datetime.now() - timedelta(days=days)
-        df_recent = self.youtube_df[
-            (self.youtube_df["Date"] >= cutoff_date) &
-            (self.youtube_df["predicted_label"] == encoded_label)
-            ].copy()
+        df_recent = self.youtube_df[(self.youtube_df["Date"] >= cutoff_date) & (self.youtube_df["predicted_label"] == encoded_label)].copy()
 
         if df_recent.empty:
             return []
@@ -205,7 +191,6 @@ class TrendAnalyzer:
         df_recent = self.normalize_youtube_metrics(df_recent)
         df_recent['engagement_score'] = df_recent.apply(self.calculate_engagement_score, axis=1)
 
-        # Create frequency and engagement dictionaries
         term_engagement = defaultdict(float)
         term_frequency = defaultdict(int)
 
@@ -215,7 +200,6 @@ class TrendAnalyzer:
                 term_engagement[term] += engagement
                 term_frequency[term] += 1
 
-        # Convert to list of dictionaries with only engagement and frequency
         youtube_trends = []
         for term in term_frequency:
             youtube_trends.append({
@@ -272,15 +256,8 @@ class TrendAnalyzer:
         encoded_label = self.label_encoder.transform([target_class])[0]
         cutoff_date = datetime.now() - timedelta(days=days)
 
-        news_series = self.df[
-            (self.df["predicted_label"] == encoded_label) &
-            (self.df["Date"] >= cutoff_date)
-            ].groupby(pd.Grouper(key="Date", freq="D")).size().reset_index(name="count")
-
-        youtube_series = self.youtube_df[
-            (self.youtube_df["predicted_label"] == encoded_label) &
-            (self.youtube_df["Date"] >= cutoff_date)
-            ].groupby(pd.Grouper(key="Date", freq="D")).size().reset_index(name="count")
+        news_series = self.df[(self.df["predicted_label"] == encoded_label) & (self.df["Date"] >= cutoff_date)].groupby(pd.Grouper(key="Date", freq="D")).size().reset_index(name="count")
+        youtube_series = self.youtube_df[(self.youtube_df["predicted_label"] == encoded_label) & (self.youtube_df["Date"] >= cutoff_date)].groupby(pd.Grouper(key="Date", freq="D")).size().reset_index(name="count")
 
         return {
             "news": {
@@ -357,7 +334,6 @@ class TrendAnalyzer:
                     if ent1 != ent2:
                         key = f"{type1}||{ent1}||{type2}||{ent2}"
                         co_occur[key] += 1
-
         serializable_co_occur = []
         for key, count in sorted(co_occur.items(), key=lambda x: -x[1])[:10]:
             parts = key.split("||")
@@ -369,39 +345,43 @@ class TrendAnalyzer:
                     "entity2": parts[3],
                     "count": count
                 })
-
         return {
             "by_type": {k: dict(v.most_common(5)) for k, v in entities.items()},
             "co_occurrence": serializable_co_occur
         }
 
     def analyze_sentiment(self, texts: List[str]) -> Dict:
-        if not self.sentiment_analyzer:
-            return {"positive": 0, "negative": 0, "neutral": 0}
+        pos_words = {
+            'جيد', 'رائع', 'ممتاز', 'فوز', 'انتصار', 'نجاح', 'مبهر', 'مذهل', 'سعيد',
+            'مفرح', 'مبهج', 'مبشر', 'تفوق', 'تميز', 'إنجاز', 'إبداع', 'احتراف', 'قوي',
+            'متفوق', 'مبتكر', 'متميز', 'فريد', 'عظيم', 'رائعة', 'مدهش', 'مبهرة'
+        }
+        neg_words = {
+            'سيء', 'خسارة', 'هزيمة', 'مشكلة', 'إصابة', 'فشل', 'خيبة', 'محزن', 'حزين',
+            'مؤلم', 'مأساة', 'كارثة', 'انهيار', 'ضعف', 'تراجع', 'إهانة', 'خيانة', 'فوضى',
+            'مخيب', 'مخزية', 'مأساوية', 'كارثية', 'مؤسفة', 'مخيبة', 'محبطة', 'مروعة'
+        }
 
         counts = Counter()
-
         for text in texts:
-            if not text or not isinstance(text, str):
+            if not text:
                 continue
 
             try:
                 normalized = normalize_unicode(text)
-                normalized = normalize_alef_maksura_ar(normalized)
+                tokens = set(self.clean_text(normalized))
+                pos = len(tokens & pos_words)
+                neg = len(tokens & neg_words)
 
-                # Get confidence scores
-                prediction = self.sentiment_analyzer.predict(normalized, return_confidence=True)
-                label, confidence = prediction
-
-                # Only accept prediction if confidence > threshold (e.g., 0.6)
-                if confidence > 0.6:
-                    counts[label] += 1
+                if pos > neg:
+                    counts["positive"] += 1
+                elif neg > pos:
+                    counts["negative"] += 1
                 else:
                     counts["neutral"] += 1
-
             except Exception as e:
-                print(f"Sentiment error: {str(e)}")
-                counts["neutral"] += 1
+                print(f"Error analyzing sentiment: {str(e)}")
+                continue
 
         return dict(counts)
 
@@ -420,36 +400,23 @@ class TrendAnalyzer:
 
 analyzer = TrendAnalyzer()
 
-
 class AnalysisRequest(BaseModel):
     target_class: str
     days: int = 7
 
-
 @app.post("/api/advanced_analysis")
 async def advanced_analysis(request: AnalysisRequest):
     try:
-        # Get trends from both sources
         news_trends = analyzer.analyze_trends_from_df(analyzer.df, request.target_class, request.days)
         youtube_trends = analyzer.analyze_youtube_trends(request.target_class, request.days)
 
-        # Combine trends
         combined_trends, news_only_trends, youtube_only_trends = analyzer.combine_trends(news_trends, youtube_trends)
 
-        # Get articles for advanced analysis
         encoded_label = analyzer.label_encoder.transform([request.target_class])[0]
         cutoff_date = datetime.now() - timedelta(days=request.days)
 
-        news_articles = analyzer.df[
-            (analyzer.df["predicted_label"] == encoded_label) &
-            (analyzer.df["Date"] >= cutoff_date)
-            ]["Title"].tolist()
-
-        youtube_articles = analyzer.youtube_df[
-            (analyzer.youtube_df["predicted_label"] == encoded_label) &
-            (analyzer.youtube_df["Date"] >= cutoff_date)
-            ]["Title"].tolist()
-
+        news_articles = analyzer.df[(analyzer.df["predicted_label"] == encoded_label) & (analyzer.df["Date"] >= cutoff_date)]["Title"].tolist()
+        youtube_articles = analyzer.youtube_df[(analyzer.youtube_df["predicted_label"] == encoded_label) & (analyzer.youtube_df["Date"] >= cutoff_date)]["Title"].tolist()
         all_articles = news_articles + youtube_articles
 
         return {
@@ -478,6 +445,36 @@ async def advanced_analysis(request: AnalysisRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/hero_trends")
+async def get_hero_trends(days: int = 7, limit: int = 10):
+    try:
+        cutoff_date = datetime.now() - timedelta(days=days)
+
+        combined_df = pd.concat([analyzer.df[["Title", "Date", "source"]],analyzer.youtube_df[["Title", "Date", "source"]]])
+        recent_df = combined_df[combined_df["Date"] >= cutoff_date]
+
+        all_terms = []
+        for title in recent_df["Title"]:
+            all_terms.extend(analyzer.clean_text(title))
+
+        term_freq = Counter(all_terms)
+        top_terms = term_freq.most_common(limit)
+
+        return {
+            "trends": [
+                {"term": term, "count": count}
+                for term, count in top_terms
+            ],
+            "time_period": f"Last {days} days"
+        }
+
+    except Exception as e:
+        return {
+            "error": str(e),
+            "trends": [],
+            "time_period": f"Last {days} days"
+        }
+
 @app.get("/api/top_categories")
 async def get_top_categories():
     return {
@@ -491,10 +488,10 @@ async def check_topic(topic: str):
     return {"exists": exists}
 
 
+############################################ Comparing topics ##########################################
 class ComparisonRequest(BaseModel):
     topics: List[str]
     days: int = 7
-
 
 @app.post("/api/compare")
 async def compare_topics(request: ComparisonRequest):
@@ -502,34 +499,46 @@ async def compare_topics(request: ComparisonRequest):
     for topic in request.topics:
         try:
             encoded_label = analyzer.label_encoder.transform([topic])[0]
+            cutoff_date = datetime.now() - timedelta(days=request.days)
 
-            # Get trends from both sources
             news_trends = analyzer.analyze_trends_from_df(analyzer.df, topic, request.days)
             youtube_trends = analyzer.analyze_youtube_trends(topic, request.days)
 
-            # Get relevant articles/videos
-            cutoff_date = datetime.now() - timedelta(days=request.days)
-            news_texts = analyzer.df[
+            time_series = analyzer.get_time_series(topic, request.days)
+
+            news_articles = analyzer.df[
                 (analyzer.df["predicted_label"] == encoded_label) &
                 (analyzer.df["Date"] >= cutoff_date)
-                ]["Title"].tolist()
-
-            youtube_texts = analyzer.youtube_df[
+            ]
+            youtube_articles = analyzer.youtube_df[
                 (analyzer.youtube_df["predicted_label"] == encoded_label) &
                 (analyzer.youtube_df["Date"] >= cutoff_date)
-                ]["Title"].tolist()
+            ]
 
-            all_texts = news_texts + youtube_texts
+            news_count = len(news_articles)
+            youtube_count = len(youtube_articles)
+            total_count = news_count + youtube_count
+
+            all_texts = news_articles["Title"].tolist() + youtube_articles["Title"].tolist()
+            sentiment = analyzer.analyze_sentiment(all_texts)
+
+            avg_engagement = np.mean([t["engagement_score"] for t in youtube_trends]) if youtube_trends else 0
 
             results[topic] = {
-                "top_terms": [t["term"] for t in news_trends[:5]],
-                "top_youtube_terms": [t["term"] for t in youtube_trends[:5]],
-                "total_mentions": len(news_texts) + len(youtube_texts),
-                "news_mentions": len(news_texts),
-                "youtube_mentions": len(youtube_texts),
-                "time_series": analyzer.get_time_series(topic, request.days),
-                "sentiment": analyzer.analyze_sentiment(all_texts),
-                "average_engagement": np.mean([t["engagement_score"] for t in youtube_trends]) if youtube_trends else 0
+                "trends": {
+                    "combined": analyzer.combine_trends(news_trends, youtube_trends)[0][:5],
+                    "news_only": news_trends[:5],
+                    "youtube_only": youtube_trends[:5]
+                },
+                "time_series": time_series,
+                "stats": {
+                    "total_mentions": total_count,
+                    "news_mentions": news_count,
+                    "youtube_mentions": youtube_count,
+                    "avg_engagement": float(avg_engagement)
+                },
+                "sentiment": sentiment,
+                "entities": analyzer.extract_entities(all_texts)
             }
         except ValueError:
             continue
@@ -537,7 +546,307 @@ async def compare_topics(request: ComparisonRequest):
     if len(results) < 2:
         raise HTTPException(status_code=400, detail="Need at least 2 valid topics to compare")
 
-    return results
+    return {
+        "comparison": results,
+        "topics": request.topics,
+        "time_period": f"Last {request.days} days"
+    }
+
+############################################ Search ##########################################
+class SearchRequest(BaseModel):
+    search_term: str
+    days: Optional[int] = 30
+    source: Optional[str] = None
+    limit: Optional[int] = 20
+
+@app.post("/api/search_articles")
+async def search_articles(request: SearchRequest):
+    try:
+        is_label = request.search_term in analyzer.label_encoder.classes_
+
+        cutoff_date = datetime.now() - timedelta(days=request.days)
+        results = []
+
+        dfs = []
+        if request.source is None or request.source == "news":
+            dfs.append(analyzer.df)
+        if request.source is None or request.source == "youtube":
+            dfs.append(analyzer.youtube_df)
+
+        for df in dfs:
+            if is_label:
+                encoded_label = analyzer.label_encoder.transform([request.search_term])[0]
+                filtered = df[(df["predicted_label"] == encoded_label) & (df["Date"] >= cutoff_date)]
+            else:
+                filtered = df[df["Title"].str.contains(request.search_term, case=False, na=False) & (df["Date"] >= cutoff_date)]
+
+            for _, row in filtered.head(request.limit).iterrows():
+                results.append({
+                    "title": row["Title"],
+                    "date": row["Date"].strftime("%Y-%m-%d") if pd.notna(row["Date"]) else None,
+                    "source": row["source"],
+                    "label": analyzer.label_encoder.inverse_transform([row["predicted_label"]])[
+                        0] if "predicted_label" in row else None
+                })
+
+        return {
+            "search_term": request.search_term,
+            "is_label_search": is_label,
+            "results": results[:request.limit],
+            "total_results": len(results),
+            "time_period": f"Last {request.days} days"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+############################################ Predictions Part ##########################################
+class ConfidenceMetrics(BaseModel):
+    self_consistency: float
+    plausibility: float
+    domain_relevance: float
+    composite_confidence: float
+    confidence_level: str
+
+class PredictionResponse(BaseModel):
+    prediction_id: str
+    type: str
+    keyword: str
+    sport: Optional[str]
+    prediction: str
+    confidence: ConfidenceMetrics
+    timestamp: str
+
+class GeminiSportsPredictor:
+    def __init__(self):
+        self.model = genai.GenerativeModel('gemini-2.0-flash')
+        self.valid_sports = [
+            'تنس', 'دراجات', 'سباحة', 'غولف', 'فورمولا 1',
+            'كرة السلة', 'كرة الطائرة', 'كرة القدم', 'كريكيت', 'ملاكمة'
+        ]
+        self.consistency_cache = {}
+
+    def _generate_content(self, prompt: str) -> str:
+        try:
+            response = self.model.generate_content(prompt)
+            if not response.text:
+                raise ValueError("Empty response from Gemini API")
+            return response.text
+        except Exception as e:
+            print(f"Generation error: {str(e)}")
+            raise
+
+    def _calculate_confidence(self, prompt: str, prediction: str) -> dict:
+        try:
+            consistency_score = self._check_self_consistency(prompt)
+            plausibility_score = self._check_plausibility(prediction)
+            domain_score = self._check_domain_relevance(prediction)
+            confidence_score = 0.5 * consistency_score + 0.3 * plausibility_score + 0.2 * domain_score
+
+            return {
+                "self_consistency": consistency_score,
+                "plausibility": plausibility_score,
+                "domain_relevance": domain_score,
+                "composite_confidence": confidence_score,
+                "confidence_level": self._get_confidence_level(confidence_score)
+            }
+        except Exception as e:
+            print(f"Confidence calculation error: {str(e)}")
+            return {
+                "self_consistency": 0,
+                "plausibility": 0,
+                "domain_relevance": 0,
+                "composite_confidence": 0,
+                "confidence_level": "غير معروف"
+            }
+
+    def _check_self_consistency(self, prompt: str, samples: int = 3) -> float:
+        if prompt in self.consistency_cache:
+            return self.consistency_cache[prompt]
+
+        responses = []
+        for _ in range(samples):
+            response = self._generate_content(prompt)
+            responses.append(response)
+
+        similarities = []
+        for a, b in combinations(responses, 2):
+            emb_a = analyzer.get_embedding(a)
+            emb_b = analyzer.get_embedding(b)
+            sim = cosine_similarity([emb_a], [emb_b])[0][0]
+            similarities.append(sim)
+
+        avg_similarity = float(np.mean(similarities))
+        self.consistency_cache[prompt] = avg_similarity
+        return avg_similarity
+
+    def _check_plausibility(self, text: str) -> float:
+        indicators = [
+            r'توقع', r'نتيجة', r'فريق', r'لاعب', r'مباراة',
+            r'بطولة', r'هدف', r'فوز', r'خسارة', r'نسبة',
+            r'\d+%', r'أسباب', r'عوامل', r'تحليل'
+        ]
+        matches = sum(1 for pattern in indicators if re.search(pattern, text))
+        return min(1.0, matches / 10)
+
+    def _check_domain_relevance(self, text: str) -> float:
+        sports_terms = [
+            'رياضة', 'رياضي', 'ملعب', 'دوري', 'كأس',
+            'مباراة', 'تسديد', 'حارس', 'هدف', 'بطولة'
+        ]
+        matches = sum(1 for term in sports_terms if term in text)
+        return min(1.0, matches / 5)
+
+    def _get_confidence_level(self, score: float) -> str:
+        if score >= 0.8:
+            return "عالية جدًا"
+        elif score >= 0.6:
+            return "عالية"
+        elif score >= 0.4:
+            return "متوسطة"
+        else:
+            return "منخفضة"
+    def predict(self, prediction_type: str, keyword: str, sport: Optional[str] = None) -> dict:
+        """Synchronous prediction method"""
+        try:
+            if prediction_type == "trend":
+                if not sport:
+                    raise ValueError("Sport is required for trend predictions")
+                prompt = self._create_future_trends_prompt(sport)
+            else:
+                prompt = self._create_match_prediction_prompt(keyword)
+
+            prediction_text = self._generate_content(prompt)
+            confidence = self._calculate_confidence(prompt, prediction_text)
+
+            return {
+                "prediction_id": str(uuid.uuid4()),
+                "type": prediction_type,
+                "keyword": keyword,
+                "sport": sport,
+                "prediction": prediction_text,
+                "confidence": confidence,
+                "timestamp": datetime.now().isoformat(),
+                "timeframe": "7 أيام قادمة" if prediction_type == "trend" else "المباراة القادمة"
+            }
+        except Exception as e:
+            error_msg = f"Error in prediction: {str(e)}"
+            print(error_msg)
+            raise HTTPException(status_code=500, detail=error_msg)
+
+    def _create_future_trends_prompt(self, sport: str) -> str:
+        """Generate prompt specifically for future trends prediction"""
+        return f"""
+        أنت خبير في تحليل اتجاهات الرياضة العربية. الرياضة المحددة هي: {sport}
+
+        المطلوب:
+        1. توقع أهم 5 اتجاهات أو مواضيع متعلقة بهذه الرياضة في الأيام 7 القادمة (وليس الحالية)
+        2. لكل اتجاه، اذكر:
+           - سبب ظهوره المتوقع في الأسبوع القادم
+           - اللاعبين/الفرق/الأحداث المرتبطة به
+           - مدى تأثيره على المشهد الرياضي
+           - احتمالية حدوثه (من 0% إلى 100%)
+        3. رتب الاتجاهات حسب:
+           - الأكثر احتمالاً للحدوث
+           - الأكثر تأثيراً على الرياضة
+
+        ملاحظات مهمة:
+        - ركز فقط على ما سيحدث في الأيام 7 القادمة
+        - لا تذكر أي أحداث حالية
+        - كن دقيقاً في التواريخ المتوقعة
+
+        أجب باللغة العربية وبشكل منظم مع عناوين واضحة.
+        """
+
+    def _create_match_prediction_prompt(self, teams: str) -> str:
+        """Generate prompt for match predictions"""
+        return f"""
+        أنت محلل رياضي محترف. المطلوب تحليل المباراة بين: {teams}
+
+        أجب باللغة العربية وبشكل منظم:
+        1. نظرة عامة على الفرق/اللاعبين
+        2. المقارنة الفنية (نقاط القوة والضعف)
+        3. العوامل المؤثرة (إصابات، ظروف، إلخ)
+        4. التوقع النهائي مع:
+           - النتيجة المتوقعة
+           - النسبة المئوية للفوز
+           - أهم اللاعبين الذين سيؤثرون في المباراة
+        5. التوقعات طويلة المدى بعد هذه المباراة
+
+        قدم إجابة مفصلة ومنظمة مع التركيز على التحليل المستقبلي.
+        """
+
+
+
+
+class AccuracyEvaluator:
+    def __init__(self):
+        self.predictions_log = "predictions_log.json"
+        self.accuracy_log = "accuracy_log.json"
+
+    def _load_log(self, log_file: str) -> list:
+        if not os.path.exists(log_file):
+            return []
+        with open(log_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _save_log(self, log_file: str, data: list):
+        with open(log_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def log_prediction(self, prediction: dict):
+        log = self._load_log(self.predictions_log)
+        log.append(prediction)
+        self._save_log(self.predictions_log, log)
+
+    def record_accuracy(self, prediction_id: str, actual_outcome: str, similarity: float):
+        accuracy_log = self._load_log(self.accuracy_log)
+        accuracy_log.append({
+            "prediction_id": prediction_id,
+            "actual_outcome": actual_outcome,
+            "similarity": similarity,
+            "evaluation_date": datetime.now().isoformat()
+        })
+        self._save_log(self.accuracy_log, accuracy_log)
+
+    def get_accuracy_stats(self) -> dict:
+        accuracy_log = self._load_log(self.accuracy_log)
+        if not accuracy_log:
+            return {"message": "No accuracy data available"}
+
+        similarities = [entry["similarity"] for entry in accuracy_log]
+        return {
+            "total_predictions": len(accuracy_log),
+            "average_accuracy": np.mean(similarities),
+            "min_accuracy": min(similarities),
+            "max_accuracy": max(similarities),
+            "last_evaluated": max(entry["evaluation_date"] for entry in accuracy_log)
+        }
+
+
+predictor = GeminiSportsPredictor()
+evaluator = AccuracyEvaluator()
+
+class PredictionRequest(BaseModel):
+    keyword: str
+    prediction_type: str
+    sport: Optional[str] = None
+
+@app.post("/api/predict")
+async def make_prediction(request: PredictionRequest):
+    try:
+        prediction = predictor.predict(
+            request.prediction_type,
+            request.keyword,
+            request.sport
+        )
+        evaluator.log_prediction(prediction)
+        return prediction
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
