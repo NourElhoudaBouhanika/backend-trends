@@ -833,6 +833,10 @@ class PredictionRequest(BaseModel):
     prediction_type: str
     sport: Optional[str] = None
 
+@app.get("/api/sports")
+async def get_supported_sports():
+    return {"sports": predictor.valid_sports}
+
 @app.post("/api/predict")
 async def make_prediction(request: PredictionRequest):
     try:
